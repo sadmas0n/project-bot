@@ -19,7 +19,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
  
 BOT_TOKEN      = "8549647812:AAGk5t7-nLe5bmzH3FQ0UDeji-fXNhDWqrA"
 MANAGER_ID     = 126009180
-SUBORDINATE_ID = 1041337530
+SUBORDINATE_ID = 802803873
 REMINDER_HOUR  = 4   # 04:00 UTC = 09:00 Tashkent (UTC+5)
 REMINDER_MIN   = 0
 TIMEZONE       = "Asia/Tashkent"
