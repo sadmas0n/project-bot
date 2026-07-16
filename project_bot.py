@@ -19,7 +19,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 BOT_TOKEN      = "8549647812:AAGk5t7-nLe5bmzH3FQ0UDeji-fXNhDWqrA"
 MANAGER_ID     = 126009180
 SUBORDINATE_ID = 8028903873
-REMINDER_HOUR  = 9
+REMINDER_HOUR  = 12
 REMINDER_MIN   = 0
 TIMEZONE       = "Asia/Tashkent"
 DB_PATH        = "projects.db"
