@@ -7,7 +7,7 @@ Project Status Tracking Bot
 
 import sqlite3
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -105,6 +105,16 @@ def db_init():
                 status_type TEXT,
                 new_date    TEXT,
                 created_at  TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        # pending_reminders: отслеживает неотвеченные напоминания
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS pending_reminders (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                sub_tg_id  INTEGER NOT NULL,
+                project_id INTEGER NOT NULL,
+                sent_at    TEXT NOT NULL,
+                retry_sent INTEGER DEFAULT 0
             )
         """)
         con.commit()
@@ -208,17 +218,6 @@ def db_get_assignees(project_id):
         ).fetchall()
         return [r[0] for r in rows]
 
-def db_projects_for_sub(sub_tg_id):
-    """Проекты с дедлайном сегодня, назначенные на подчинённого."""
-    today = date.today().isoformat()
-    with sqlite3.connect(DB_PATH) as con:
-        return con.execute("""
-            SELECT p.id, p.name, p.deadline
-            FROM projects p
-            JOIN project_assignees pa ON pa.project_id = p.id
-            WHERE pa.sub_tg_id=? AND p.deadline=?
-        """, (sub_tg_id, today)).fetchall()
-
 def db_all_projects_for_sub(sub_tg_id):
     with sqlite3.connect(DB_PATH) as con:
         return con.execute("""
@@ -228,6 +227,53 @@ def db_all_projects_for_sub(sub_tg_id):
             WHERE pa.sub_tg_id=?
             ORDER BY p.deadline
         """, (sub_tg_id,)).fetchall()
+
+def db_projects_due_today_for_sub(sub_tg_id):
+    today = date.today().isoformat()
+    with sqlite3.connect(DB_PATH) as con:
+        return con.execute("""
+            SELECT p.id, p.name, p.deadline
+            FROM projects p
+            JOIN project_assignees pa ON pa.project_id = p.id
+            WHERE pa.sub_tg_id=? AND p.deadline=?
+        """, (sub_tg_id, today)).fetchall()
+
+# — Отслеживание неотвеченных напоминаний —
+
+def db_add_pending(sub_tg_id, project_id):
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            "INSERT INTO pending_reminders (sub_tg_id, project_id, sent_at) VALUES (?,?,datetime('now'))",
+            (sub_tg_id, project_id)
+        )
+        con.commit()
+
+def db_clear_pending(sub_tg_id, project_id):
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            "DELETE FROM pending_reminders WHERE sub_tg_id=? AND project_id=?",
+            (sub_tg_id, project_id)
+        )
+        con.commit()
+
+def db_clear_all_pending_for_sub(sub_tg_id):
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("DELETE FROM pending_reminders WHERE sub_tg_id=?", (sub_tg_id,))
+        con.commit()
+
+def db_get_overdue_pending(minutes=30):
+    """Напоминания, отправленные более N минут назад, без повторного напоминания."""
+    with sqlite3.connect(DB_PATH) as con:
+        return con.execute("""
+            SELECT id, sub_tg_id, project_id FROM pending_reminders
+            WHERE retry_sent=0
+              AND datetime(sent_at, '+' || ? || ' minutes') <= datetime('now')
+        """, (minutes,)).fetchall()
+
+def db_mark_retry_sent(reminder_id):
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("UPDATE pending_reminders SET retry_sent=1 WHERE id=?", (reminder_id,))
+        con.commit()
 
 
 def is_manager(uid): return uid == MANAGER_ID
@@ -255,10 +301,9 @@ def format_project_list():
         icon = STATUS_ICONS.get(status_type or "", "")
         st = f"\n    └ {icon} {last_status}" if last_status else ""
         upd = f" _(обновлено {fmt_date(updated_at[:10])})_" if updated_at else ""
-        # Назначенные
-        assignees = db_get_assignees(pid)
         subs = db_list_subordinates()
         sub_map = {s[0]: sub_display(s[1], s[2]) for s in subs}
+        assignees = db_get_assignees(pid)
         assigned_str = ", ".join(sub_map[a] for a in assignees if a in sub_map)
         assigned_line = f"\n    👤 {assigned_str}" if assigned_str else ""
         lines.append(f"{flag} *{name}*\n    Контроль: `{fmt_date(deadline)}` ({days_str}){upd}{assigned_line}{st}")
@@ -267,14 +312,15 @@ def format_project_list():
 
 # ── Состояние диалога ─────────────────────────────────────────────────────────
 
-dialog_state = {}   # uid -> state dict
+dialog_state  = {}  # sub_id -> state
 manager_state = {}  # менеджер: состояние создания проекта
 
 
-# ── Вспомогательная: сохранить и уведомить ────────────────────────────────────
+# ── Вспомогательные ───────────────────────────────────────────────────────────
 
 async def save_and_notify(bot, sub_id, state, status_text, status_type, new_date_iso):
     db_update_status(state["project_id"], status_text, status_type, new_date_iso)
+    db_clear_pending(sub_id, state["project_id"])
     dialog_state.pop(sub_id, None)
     icon = STATUS_ICONS.get(status_type, "")
     await bot.send_message(
@@ -286,9 +332,6 @@ async def save_and_notify(bot, sub_id, state, status_text, status_type, new_date
         parse_mode="Markdown"
     )
 
-
-# ── Кнопки выбора назначенных ─────────────────────────────────────────────────
-
 def build_assignee_keyboard(selected_ids: set):
     subs = db_list_subordinates()
     btns = []
@@ -299,8 +342,26 @@ def build_assignee_keyboard(selected_ids: set):
     btns.append([InlineKeyboardButton("Сохранить →", callback_data="assign_done")])
     return InlineKeyboardMarkup(btns)
 
+async def _send_update_request(bot, sub_id, projects):
+    btns = [
+        [InlineKeyboardButton(
+            f"{name}  |  {fmt_date(deadline)}",
+            callback_data=f"update:{pid}:{name}"
+        )]
+        for pid, name, deadline, *_ in projects
+    ]
+    await bot.send_message(
+        sub_id,
+        "📋 *Обнови статус по проектам.* Выбери проект:",
+        reply_markup=InlineKeyboardMarkup(btns),
+        parse_mode="Markdown"
+    )
+    # Фиксируем каждый проект как ожидающий ответа
+    for pid, *_ in projects:
+        db_add_pending(sub_id, pid)
 
-# ── Команды менеджера ──────────────────────────────────────────────────────────
+
+# ── Команды ───────────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -310,7 +371,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "👋 Привет! Ты подключён как *менеджер*.\n\n"
             "Команды:\n"
-            "/add Название | ДД-ММ-ГГ — добавить проект\n"
+            "/add — добавить проект\n"
             "/remove Название — удалить проект\n"
             "/list — все проекты\n"
             "/report — запросить обновление\n"
@@ -325,40 +386,29 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("👋 Привет! Ожидай напоминаний от менеджера.")
         return
 
-    # Новый пользователь — уведомляем менеджера с кнопками
+    # Новый пользователь — уведомляем менеджера
     name = user.full_name or "Без имени"
     username = user.username or ""
-    uname_str = f"@{username}" if username else "нет username"
-
-    # Сохраняем данные нового пользователя во временное хранилище
     ctx.bot_data[f"pending_{uid}"] = {"name": name, "username": username}
 
-    btns = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Добавить", callback_data=f"approve:{uid}"),
-            InlineKeyboardButton("❌ Отклонить", callback_data=f"reject:{uid}"),
-        ]
-    ])
+    btns = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Добавить", callback_data=f"approve:{uid}"),
+        InlineKeyboardButton("❌ Отклонить", callback_data=f"reject:{uid}"),
+    ]])
+    uname_str = f"@{username}" if username else "нет username"
     await ctx.bot.send_message(
         MANAGER_ID,
-        f"👤 *Запрос на доступ к боту:*\n\n"
-        f"Имя: {name}\n"
-        f"Username: {uname_str}\n"
-        f"ID: `{uid}`",
+        f"👤 *Запрос на доступ:*\n\nИмя: {name}\nUsername: {uname_str}\nID: `{uid}`",
         reply_markup=btns,
         parse_mode="Markdown"
     )
-    await update.message.reply_text(
-        "Твой запрос отправлен менеджеру. Ожидай подтверждения."
-    )
+    await update.message.reply_text("Твой запрос отправлен менеджеру. Ожидай подтверждения.")
 
 async def cmd_subordinates(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_manager(update.effective_user.id): return
     rows = db_list_subordinates()
     if not rows:
-        await update.message.reply_text(
-            "Подчинённых пока нет.\n\nЧтобы добавить — попроси человека написать /start этому боту."
-        )
+        await update.message.reply_text("Подчинённых пока нет. Попроси их написать /start боту.")
         return
     lines = ["👥 *Список подчинённых:*\n"]
     for tg_id, name, username in rows:
@@ -383,50 +433,10 @@ async def cmd_remove_sub(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Подчинённый с ID `{tg_id}` не найден.", parse_mode="Markdown")
 
 async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Начинает диалог добавления проекта: сначала спрашивает название."""
     if not is_manager(update.effective_user.id): return
-    try:
-        text = " ".join(ctx.args)
-        name, date_str = [x.strip() for x in text.split("|", 1)]
-        dl = parse_date(date_str)
-    except Exception:
-        await update.message.reply_text("⚠️ Формат: /add Название проекта | ДД-ММ-ГГ")
-        return
-    if dl < date.today():
-        await update.message.reply_text("⚠️ Нельзя назначить контроль на прошедшую дату.")
-        return
-
-    subs = db_list_subordinates()
-    if not subs:
-        # Нет подчинённых — создаём без назначений
-        if db_add_project(name, dl.isoformat()):
-            await update.message.reply_text(
-                f"✅ Проект *{name}* добавлен. Контроль: `{fmt_date(dl.isoformat())}`\n"
-                f"_(подчинённых нет, назначения пропущены)_",
-                parse_mode="Markdown"
-            )
-        else:
-            await update.message.reply_text(f"⚠️ Проект *{name}* уже существует.")
-        return
-
-    # Есть подчинённые — начинаем выбор назначенных
-    if not db_add_project(name, dl.isoformat()):
-        await update.message.reply_text(f"⚠️ Проект *{name}* уже существует.")
-        return
-
-    proj_id = db_get_project_id(name)
-    manager_state[MANAGER_ID] = {
-        "step": "assign",
-        "project_id": proj_id,
-        "project_name": name,
-        "deadline": dl.isoformat(),
-        "selected": set()
-    }
-    await update.message.reply_text(
-        f"✅ Проект *{name}* создан. Контроль: `{fmt_date(dl.isoformat())}`\n\n"
-        f"Выбери подчинённых для этого проекта:",
-        reply_markup=build_assignee_keyboard(set()),
-        parse_mode="Markdown"
-    )
+    manager_state[MANAGER_ID] = {"step": "ask_name"}
+    await update.message.reply_text("Введи название проекта:")
 
 async def cmd_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_manager(update.effective_user.id): return
@@ -482,6 +492,73 @@ async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown")
 
 
+# ── Текстовые сообщения менеджера (диалог создания проекта) ───────────────────
+
+async def handle_manager_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_manager(uid): return
+
+    state = manager_state.get(MANAGER_ID)
+    if not state:
+        return
+
+    step = state.get("step")
+
+    if step == "ask_name":
+        name = update.message.text.strip()
+        if not name:
+            await update.message.reply_text("Название не может быть пустым. Введи название проекта:")
+            return
+        state["name"] = name
+        state["step"] = "ask_date"
+        manager_state[MANAGER_ID] = state
+        await update.message.reply_text(
+            f"Проект: *{name}*\n\nТеперь введи дату контроля в формате ДД-ММ-ГГ:",
+            parse_mode="Markdown"
+        )
+
+    elif step == "ask_date":
+        try:
+            dl = parse_date(update.message.text)
+        except ValueError:
+            await update.message.reply_text("Неверный формат. Введи дату как ДД-ММ-ГГ (например 25-07-26):")
+            return
+        if dl < date.today():
+            await update.message.reply_text("Нельзя назначить контроль на прошедшую дату. Введи другую дату:")
+            return
+
+        name = state["name"]
+        if not db_add_project(name, dl.isoformat()):
+            await update.message.reply_text(f"⚠️ Проект *{name}* уже существует.", parse_mode="Markdown")
+            manager_state.pop(MANAGER_ID, None)
+            return
+
+        proj_id = db_get_project_id(name)
+        subs = db_list_subordinates()
+
+        if not subs:
+            manager_state.pop(MANAGER_ID, None)
+            await update.message.reply_text(
+                f"✅ Проект *{name}* добавлен. Контроль: `{fmt_date(dl.isoformat())}`\n"
+                f"_(подчинённых нет, назначения пропущены)_",
+                parse_mode="Markdown"
+            )
+            return
+
+        state["project_id"] = proj_id
+        state["deadline"] = dl.isoformat()
+        state["selected"] = set()
+        state["step"] = "assign"
+        manager_state[MANAGER_ID] = state
+
+        await update.message.reply_text(
+            f"✅ Проект *{name}* создан. Контроль: `{fmt_date(dl.isoformat())}`\n\n"
+            f"Выбери подчинённых для этого проекта:",
+            reply_markup=build_assignee_keyboard(set()),
+            parse_mode="Markdown"
+        )
+
+
 # ── Обработчик кнопок ─────────────────────────────────────────────────────────
 
 async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -490,7 +567,7 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = query.data
     await query.answer()
 
-    # ── Менеджер: одобрить/отклонить нового пользователя
+    # Одобрить/отклонить нового пользователя
     if data.startswith("approve:") and is_manager(uid):
         new_uid = int(data.split(":")[1])
         pending = ctx.bot_data.get(f"pending_{new_uid}", {})
@@ -498,10 +575,7 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         username = pending.get("username", "")
         db_add_subordinate(new_uid, name, username)
         ctx.bot_data.pop(f"pending_{new_uid}", None)
-        await query.edit_message_text(
-            f"✅ {name} добавлен как подчинённый.",
-            parse_mode="Markdown"
-        )
+        await query.edit_message_text(f"✅ {name} добавлен как подчинённый.")
         await ctx.bot.send_message(new_uid, "✅ Менеджер дал тебе доступ к боту. Ожидай напоминаний!")
 
     elif data.startswith("reject:") and is_manager(uid):
@@ -512,37 +586,33 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"❌ {name} отклонён.")
         await ctx.bot.send_message(new_uid, "К сожалению, менеджер не дал доступ к боту.")
 
-    # ── Менеджер: выбор назначенных при создании проекта
+    # Выбор назначенных
     elif data.startswith("assign_toggle:") and is_manager(uid):
         sub_id = int(data.split(":")[1])
         state = manager_state.get(MANAGER_ID)
-        if not state or state.get("step") != "assign":
-            return
+        if not state or state.get("step") != "assign": return
         selected = state["selected"]
         if sub_id in selected:
             selected.discard(sub_id)
         else:
             selected.add(sub_id)
-        await query.edit_message_reply_markup(
-            reply_markup=build_assignee_keyboard(selected)
-        )
+        await query.edit_message_reply_markup(reply_markup=build_assignee_keyboard(selected))
 
     elif data == "assign_done" and is_manager(uid):
         state = manager_state.pop(MANAGER_ID, None)
-        if not state:
-            return
+        if not state: return
         db_set_assignees(state["project_id"], state["selected"])
         subs = db_list_subordinates()
         sub_map = {s[0]: sub_display(s[1], s[2]) for s in subs}
         assigned_names = ", ".join(sub_map[s] for s in state["selected"] if s in sub_map) or "никто"
         await query.edit_message_text(
-            f"✅ Проект *{state['project_name']}* сохранён.\n"
+            f"✅ Проект *{state['name']}* сохранён.\n"
             f"Контроль: `{fmt_date(state['deadline'])}`\n"
             f"Назначены: {assigned_names}",
             parse_mode="Markdown"
         )
 
-    # ── Подчинённый: выбор проекта
+    # Подчинённый выбрал проект
     elif data.startswith("update:") and db_is_subordinate(uid):
         parts = data.split(":", 2)
         proj_id, proj_name = int(parts[1]), parts[2]
@@ -564,7 +634,7 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
 
-    # ── Подчинённый: выбор статуса
+    # Подчинённый выбрал статус
     elif data.startswith("status:") and db_is_subordinate(uid):
         status_type = data.split(":", 1)[1]
         state = dialog_state.get(uid, {})
@@ -631,22 +701,14 @@ async def handle_sub_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
 
-# ── Взаимодействие с подчинёнными ─────────────────────────────────────────────
+# ── Общий обработчик текста ───────────────────────────────────────────────────
 
-async def _send_update_request(bot, sub_id, projects):
-    btns = [
-        [InlineKeyboardButton(
-            f"{name}  |  {fmt_date(deadline)}",
-            callback_data=f"update:{pid}:{name}"
-        )]
-        for pid, name, deadline, *_ in projects
-    ]
-    await bot.send_message(
-        sub_id,
-        "📋 *Обнови статус по проектам.* Выбери проект:",
-        reply_markup=InlineKeyboardMarkup(btns),
-        parse_mode="Markdown"
-    )
+async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if is_manager(uid):
+        await handle_manager_message(update, ctx)
+    elif db_is_subordinate(uid):
+        await handle_sub_message(update, ctx)
 
 
 # ── Планировщик ───────────────────────────────────────────────────────────────
@@ -656,7 +718,7 @@ async def morning_reminder(bot):
     if not subs: return
     sent = 0
     for sub_id, name, username in subs:
-        due = db_projects_for_sub(sub_id)
+        due = db_projects_due_today_for_sub(sub_id)
         if due:
             btns = [
                 [InlineKeyboardButton(pname, callback_data=f"update:{pid}:{pname}")]
@@ -667,10 +729,10 @@ async def morning_reminder(bot):
                 f"🔔 Сегодня контрольная дата по {len(due)} проект(ам)! Обнови статус:",
                 reply_markup=InlineKeyboardMarkup(btns)
             )
+            for pid, *_ in due:
+                db_add_pending(sub_id, pid)
             sent += 1
     if sent:
-        # Уведомление менеджеру
-        today = date.today().isoformat()
         due_all = db_projects_due_today()
         names = "\n".join(f"• {n}" for _, n, _ in due_all)
         await bot.send_message(
@@ -678,6 +740,40 @@ async def morning_reminder(bot):
             f"📅 *Сегодня контрольная дата:*\n{names}\n\nЗапрос отправлен подчинённым.",
             parse_mode="Markdown"
         )
+
+async def retry_reminder(bot):
+    """Каждые 5 минут проверяем неотвеченные напоминания старше 30 минут."""
+    overdue = db_get_overdue_pending(minutes=30)
+    if not overdue: return
+
+    # Группируем по подчинённому
+    by_sub = {}
+    for rem_id, sub_tg_id, project_id in overdue:
+        by_sub.setdefault(sub_tg_id, []).append((rem_id, project_id))
+
+    for sub_tg_id, items in by_sub.items():
+        # Собираем проекты для повторного напоминания
+        proj_ids = [pid for _, pid in items]
+        with sqlite3.connect(DB_PATH) as con:
+            placeholders = ",".join("?" * len(proj_ids))
+            projects = con.execute(
+                f"SELECT id, name, deadline FROM projects WHERE id IN ({placeholders})",
+                proj_ids
+            ).fetchall()
+
+        if projects:
+            btns = [
+                [InlineKeyboardButton(f"{name}  |  {fmt_date(dl)}", callback_data=f"update:{pid}:{name}")]
+                for pid, name, dl in projects
+            ]
+            await bot.send_message(
+                sub_tg_id,
+                "⚠️ Напоминание: ты ещё не обновил статус по проектам. Пожалуйста, сделай это сейчас:",
+                reply_markup=InlineKeyboardMarkup(btns)
+            )
+
+        for rem_id, _ in items:
+            db_mark_retry_sent(rem_id)
 
 
 # ── Запуск ────────────────────────────────────────────────────────────────────
@@ -694,10 +790,11 @@ def main():
     app.add_handler(CommandHandler("report",       cmd_report))
     app.add_handler(CommandHandler("history",      cmd_history))
     app.add_handler(CallbackQueryHandler(callback_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_sub_message))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     scheduler = AsyncIOScheduler(timezone=TIMEZONE)
     scheduler.add_job(morning_reminder, "cron", hour=REMINDER_HOUR, minute=REMINDER_MIN, args=[app.bot])
+    scheduler.add_job(retry_reminder, "interval", minutes=5, args=[app.bot])
     scheduler.start()
 
     log.info("Бот запущен.")
